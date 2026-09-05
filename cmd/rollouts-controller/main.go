@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -39,6 +40,7 @@ import (
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
 	"github.com/argoproj/argo-rollouts/utils/tolerantinformer"
+	traceutil "github.com/argoproj/argo-rollouts/utils/trace"
 	"github.com/argoproj/argo-rollouts/utils/version"
 )
 
@@ -89,6 +91,11 @@ func newCommand() *cobra.Command {
 		selfServiceNotificationEnabled bool
 		controllersEnabled             []string
 		pprofAddress                   string
+		otlpAddress                    string
+		otlpInsecure                   bool
+		otlpHeaders                    map[string]string
+		otlpAttrs                      []string
+		otlpSampleRatio                float64
 	)
 	electOpts := controller.NewLeaderElectionOptions()
 	var command = cobra.Command{
@@ -110,6 +117,23 @@ func newCommand() *cobra.Command {
 
 			// set up signals so we handle the first shutdown signal gracefully
 			ctx := signals.SetupSignalHandlerContext()
+			shutdownTracer, err := traceutil.InitTracer(ctx, cliName, version.GetVersion().String(), traceutil.Config{
+				Address:     otlpAddress,
+				Insecure:    otlpInsecure,
+				Headers:     otlpHeaders,
+				Attributes:  otlpAttrs,
+				SampleRatio: otlpSampleRatio,
+			})
+			if err != nil {
+				return fmt.Errorf("initialize OpenTelemetry tracing: %w", err)
+			}
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := shutdownTracer(shutdownCtx); err != nil {
+					log.Errorf("Failed to shut down OpenTelemetry tracing: %v", err)
+				}
+			}()
 
 			defaults.SetVerifyTargetGroup(awsVerifyTargetGroup)
 			defaults.SetTargetGroupBindingAPIVersion(targetGroupBindingVersion)
@@ -304,7 +328,7 @@ func newCommand() *cobra.Command {
 					selfServiceNotificationEnabled)
 			}
 			if err = cm.Run(ctx, rolloutThreads, serviceThreads, ingressThreads, experimentThreads, analysisThreads, electOpts); err != nil {
-				log.Fatalf("Error running controller: %s", err.Error())
+				return fmt.Errorf("run controller: %w", err)
 			}
 			return nil
 		},
@@ -355,6 +379,11 @@ func newCommand() *cobra.Command {
 	command.Flags().BoolVar(&selfServiceNotificationEnabled, "self-service-notification-enabled", false, "Allows rollouts controller to pull notification config from the namespace that the rollout resource is in. This is useful for self-service notification.")
 	command.Flags().StringSliceVar(&controllersEnabled, "controllers", nil, "Explicitly specify the list of controllers to run, currently only supports 'analysis', eg. --controller=analysis. Default: all controllers are enabled")
 	command.Flags().StringVar(&pprofAddress, "enable-pprof-address", "", "Enable pprof profiling on controller by providing a server address.")
+	command.Flags().StringVar(&otlpAddress, "otlp-address", "", "OpenTelemetry collector address to send traces to")
+	command.Flags().BoolVar(&otlpInsecure, "otlp-insecure", true, "Use an insecure connection to the OpenTelemetry collector")
+	command.Flags().StringToStringVar(&otlpHeaders, "otlp-headers", nil, "Comma-separated headers sent to the OpenTelemetry collector (for example, key1=value1,key2=value2)")
+	command.Flags().StringArrayVar(&otlpAttrs, "otlp-attrs", nil, "OpenTelemetry resource attribute in key:value form; may be repeated")
+	command.Flags().Float64Var(&otlpSampleRatio, "otlp-sample-ratio", 1, "Fraction of reconciliation traces to sample, from 0 (none) to 1 (all)")
 	return &command
 }
 

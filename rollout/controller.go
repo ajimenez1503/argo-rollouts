@@ -3,6 +3,7 @@ package rollout
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -11,6 +12,10 @@ import (
 
 	smiclientset "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -57,6 +62,7 @@ import (
 	rolloututil "github.com/argoproj/argo-rollouts/utils/rollout"
 	serviceutil "github.com/argoproj/argo-rollouts/utils/service"
 	timeutil "github.com/argoproj/argo-rollouts/utils/time"
+	traceutil "github.com/argoproj/argo-rollouts/utils/trace"
 	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
 )
 
@@ -84,6 +90,7 @@ type Controller struct {
 	// rolloutVersionTracker remembers ResourceVersions from our last successful writes so
 	// syncHandler can requeue when the informer cache hasn't caught up yet.
 	rolloutVersionTracker *resourceversionutil.Tracker
+	tracer                oteltrace.Tracer
 }
 
 // ControllerConfig describes the data required to instantiate a new rollout controller
@@ -222,6 +229,7 @@ func NewController(cfg ControllerConfig) *Controller {
 		serviceWorkqueue:      cfg.ServiceWorkQueue,
 		ingressWorkqueue:      cfg.IngressWorkQueue,
 		rolloutVersionTracker: resourceversionutil.NewTracker(),
+		tracer:                otel.Tracer(traceutil.InstrumentationName + "/rollout"),
 	}
 	controller.enqueueRollout = func(obj any) {
 		controllerutil.EnqueueRateLimited(obj, cfg.RolloutWorkQueue)
@@ -390,7 +398,24 @@ func (c *Controller) Run(ctx context.Context, threadiness int) error {
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Phase block of the Rollout resource
 // with the current status of the resource.
-func (c *Controller) syncHandler(ctx context.Context, key string) error {
+func (c *Controller) syncHandler(ctx context.Context, key string) (retErr error) {
+	ctx, span := c.tracer.Start(ctx, "controller.Rollout", oteltrace.WithNewRoot())
+	var tracedRollout *v1alpha1.Rollout
+	defer func() {
+		recovered := recover()
+		setRolloutTraceAttributes(span, tracedRollout)
+		if recovered != nil {
+			traceutil.EndSpanWithPanic(span)
+			panic(recovered)
+		}
+		if errors.Is(retErr, controllerutil.StaleCacheError) {
+			traceutil.EndSpan(span, nil)
+			return
+		}
+		setRolloutTraceStatus(span, tracedRollout)
+		traceutil.EndSpan(span, retErr)
+	}()
+
 	startTime := timeutil.Now()
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -404,6 +429,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	tracedRollout = rollout
 
 	if c.rolloutVersionTracker.IsCacheStale(key, rollout.ResourceVersion) {
 		return controllerutil.StaleCacheError
@@ -413,6 +439,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	// rollout spec and pod template spec, the hash will be consistent. See issue #70
 	// This also returns a copy of the rollout to prevent mutation of the informer cache.
 	r := remarshalRollout(rollout)
+	tracedRollout = r
 	logCtx := logutil.WithRollout(r)
 	logCtx = logutil.WithVersionFields(logCtx, r)
 	logCtx.Info("Started syncing rollout")
@@ -437,6 +464,10 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		}
 		return err
 	}
+	tracedRollout = roCtx.rollout
+	if roCtx.newRollout != nil {
+		tracedRollout = roCtx.newRollout
+	}
 	if err != nil {
 		if _, ok := err.(*field.Error); ok {
 			logCtx := logutil.WithRollout(roCtx.rollout)
@@ -450,6 +481,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		return err
 	}
 	if roCtx.newRollout != nil {
+		tracedRollout = roCtx.newRollout
 		// We modified the rollout object already. Let the next reconciliation process the update.
 		c.rolloutVersionTracker.Record(key, roCtx.newRollout.ResourceVersion)
 		return nil
@@ -464,11 +496,17 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		if err != nil {
 			return err
 		}
+		tracedRollout = newRollout
 		c.rolloutVersionTracker.Record(key, newRollout.ResourceVersion)
 		return nil
 	}
 
 	err = roCtx.reconcile()
+	if roCtx.newRollout != nil {
+		tracedRollout = roCtx.newRollout
+	} else {
+		tracedRollout = roCtx.rollout
+	}
 	if err != nil {
 		logCtx.Errorf("roCtx.reconcile err %v", err)
 		// return an err here so that we do not update the informer cache with a "bad" rollout object, for the case when
@@ -481,6 +519,120 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		c.rolloutVersionTracker.Record(key, roCtx.newRollout.ResourceVersion)
 	}
 	return nil
+}
+
+func setRolloutTraceAttributes(span oteltrace.Span, rollout *v1alpha1.Rollout) {
+	if rollout == nil {
+		return
+	}
+
+	phase := string(rollout.Status.Phase)
+	if phase == "" {
+		phase = "Unknown"
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("k8s.namespace.name", rollout.Namespace),
+		attribute.String("argo.rollouts.rollout.name", rollout.Name),
+		attribute.Int64("argo.rollouts.rollout.generation", rollout.Generation),
+		attribute.String("argo.rollouts.rollout.strategy", rolloutStrategy(rollout)),
+		attribute.String("argo.rollouts.rollout.phase", phase),
+		attribute.Bool("argo.rollouts.rollout.aborted", rollout.Status.Abort),
+		attribute.Bool("argo.rollouts.rollout.promote_full", rollout.Status.PromoteFull),
+	}
+	if rollout.UID != "" {
+		attrs = append(attrs, attribute.String("argo.rollouts.rollout.uid", string(rollout.UID)))
+	}
+	if rollout.Status.ObservedGeneration != "" {
+		attrs = append(attrs, attribute.String("argo.rollouts.rollout.observed_generation", rollout.Status.ObservedGeneration))
+	}
+	attrs = appendRolloutStepTraceAttributes(attrs, rollout)
+	span.SetAttributes(attrs...)
+}
+
+func setRolloutTraceStatus(span oteltrace.Span, rollout *v1alpha1.Rollout) {
+	if rollout == nil {
+		return
+	}
+
+	switch {
+	case rollout.Status.Abort || rollout.Status.AbortedAt != nil:
+		span.SetStatus(codes.Error, "rollout aborted")
+	case rollout.Status.Phase == v1alpha1.RolloutPhaseDegraded:
+		span.SetStatus(codes.Error, "rollout degraded")
+	}
+}
+
+func appendRolloutStepTraceAttributes(attrs []attribute.KeyValue, rollout *v1alpha1.Rollout) []attribute.KeyValue {
+	step, index := replicasetutil.GetCurrentCanaryStep(rollout)
+	if index == nil {
+		return attrs
+	}
+	attrs = append(attrs, attribute.Int64("argo.rollouts.rollout.current_step.index", int64(*index)))
+	if step == nil {
+		completionValue := "all_steps_completed"
+		if rollout.Status.Phase == v1alpha1.RolloutPhaseHealthy {
+			completionValue = "promoted"
+		}
+		return append(attrs,
+			attribute.String("argo.rollouts.rollout.current_step.type", "completed"),
+			attribute.String("argo.rollouts.rollout.current_step.value", completionValue),
+		)
+	}
+
+	stepType, stepValue := canaryStepTraceValue(step)
+	attrs = append(attrs, attribute.String("argo.rollouts.rollout.current_step.type", stepType))
+	if stepValue != "" {
+		attrs = append(attrs, attribute.String("argo.rollouts.rollout.current_step.value", stepValue))
+	}
+	return attrs
+}
+
+func canaryStepTraceValue(step *v1alpha1.CanaryStep) (string, string) {
+	switch {
+	case step.SetWeight != nil:
+		return "set_weight", strconv.Itoa(int(*step.SetWeight))
+	case step.Pause != nil && step.Pause.Duration != nil:
+		seconds := step.Pause.DurationSeconds()
+		if seconds < 0 {
+			return "pause", "invalid"
+		}
+		return "pause", strconv.Itoa(int(seconds))
+	case step.Pause != nil:
+		return "pause", "indefinite"
+	case step.Experiment != nil:
+		return "experiment", ""
+	case step.Analysis != nil:
+		return "analysis", ""
+	case step.SetCanaryScale != nil && step.SetCanaryScale.Weight != nil:
+		return "set_canary_scale", "weight:" + strconv.Itoa(int(*step.SetCanaryScale.Weight))
+	case step.SetCanaryScale != nil && step.SetCanaryScale.Replicas != nil:
+		return "set_canary_scale", "replicas:" + strconv.Itoa(int(*step.SetCanaryScale.Replicas))
+	case step.SetCanaryScale != nil && step.SetCanaryScale.MatchTrafficWeight:
+		return "set_canary_scale", "match_traffic_weight"
+	case step.SetCanaryScale != nil:
+		return "set_canary_scale", ""
+	case step.SetHeaderRoute != nil:
+		return "set_header_route", ""
+	case step.SetMirrorRoute != nil && step.SetMirrorRoute.Percentage != nil:
+		return "set_mirror_route", strconv.Itoa(int(*step.SetMirrorRoute.Percentage))
+	case step.SetMirrorRoute != nil:
+		return "set_mirror_route", ""
+	case step.Plugin != nil:
+		return "plugin", ""
+	default:
+		return "unknown", ""
+	}
+}
+
+func rolloutStrategy(rollout *v1alpha1.Rollout) string {
+	switch {
+	case rollout.Spec.Strategy.Canary != nil:
+		return "canary"
+	case rollout.Spec.Strategy.BlueGreen != nil:
+		return "blue_green"
+	default:
+		return "unknown"
+	}
 }
 
 func (c *Controller) newRolloutContext(rollout *v1alpha1.Rollout) (*rolloutContext, error) {

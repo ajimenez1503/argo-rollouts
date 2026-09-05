@@ -6,6 +6,10 @@ import (
 	"time"
 
 	"github.com/aws/smithy-go/ptr"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -35,6 +39,7 @@ import (
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
 	"github.com/argoproj/argo-rollouts/utils/record"
 	timeutil "github.com/argoproj/argo-rollouts/utils/time"
+	traceutil "github.com/argoproj/argo-rollouts/utils/trace"
 )
 
 var (
@@ -74,6 +79,7 @@ type Controller struct {
 	// Kubernetes API.
 	recorder     record.EventRecorder
 	resyncPeriod time.Duration
+	tracer       oteltrace.Tracer
 }
 
 // ControllerConfig describes the data required to instantiate a new analysis controller
@@ -103,6 +109,7 @@ func NewController(cfg ControllerConfig) *Controller {
 		analysisRunSynced:    cfg.AnalysisRunInformer.Informer().HasSynced,
 		recorder:             cfg.Recorder,
 		resyncPeriod:         cfg.ResyncPeriod,
+		tracer:               otel.Tracer(traceutil.InstrumentationName + "/analysis"),
 	}
 
 	controller.enqueueAnalysis = func(obj any) {
@@ -169,7 +176,20 @@ func (c *Controller) Run(ctx context.Context, threadiness int) error {
 	return nil
 }
 
-func (c *Controller) syncHandler(ctx context.Context, key string) error {
+func (c *Controller) syncHandler(ctx context.Context, key string) (retErr error) {
+	_, span := c.tracer.Start(ctx, "controller.AnalysisRun", oteltrace.WithNewRoot())
+	var tracedRun *v1alpha1.AnalysisRun
+	defer func() {
+		recovered := recover()
+		setAnalysisRunTraceAttributes(span, tracedRun)
+		if recovered != nil {
+			traceutil.EndSpanWithPanic(span)
+			panic(recovered)
+		}
+		setAnalysisRunTraceStatus(span, tracedRun)
+		traceutil.EndSpan(span, retErr)
+	}()
+
 	startTime := timeutil.Now()
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
@@ -184,6 +204,7 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	tracedRun = run
 
 	defer func() {
 		duration := time.Since(startTime)
@@ -198,7 +219,63 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	}
 
 	newRun := c.reconcileAnalysisRun(run)
-	return c.persistAnalysisRunStatus(run, newRun.Status)
+	err = c.persistAnalysisRunStatus(run, newRun.Status)
+	if err == nil {
+		tracedRun = newRun
+	}
+	return err
+}
+
+func setAnalysisRunTraceAttributes(span oteltrace.Span, run *v1alpha1.AnalysisRun) {
+	if run == nil {
+		return
+	}
+
+	phase := string(run.Status.Phase)
+	if phase == "" {
+		phase = "Unknown"
+	}
+	attrs := []attribute.KeyValue{
+		attribute.String("k8s.namespace.name", run.Namespace),
+		attribute.String("argo.rollouts.analysis_run.name", run.Name),
+		attribute.Int64("argo.rollouts.analysis_run.generation", run.Generation),
+		attribute.String("argo.rollouts.analysis_run.phase", phase),
+		attribute.Int("argo.rollouts.analysis_run.metrics.count", len(run.Spec.Metrics)),
+	}
+	attrs = append(attrs, analysisRunMetricResultTraceAttributes(run.Status.MetricResults)...)
+	if run.UID != "" {
+		attrs = append(attrs, attribute.String("argo.rollouts.analysis_run.uid", string(run.UID)))
+	}
+	span.SetAttributes(attrs...)
+}
+
+func setAnalysisRunTraceStatus(span oteltrace.Span, run *v1alpha1.AnalysisRun) {
+	if run == nil {
+		return
+	}
+
+	switch run.Status.Phase {
+	case v1alpha1.AnalysisPhaseFailed:
+		span.SetStatus(codes.Error, "analysis run failed")
+	case v1alpha1.AnalysisPhaseError:
+		span.SetStatus(codes.Error, "analysis run error")
+	}
+}
+
+func analysisRunMetricResultTraceAttributes(results []v1alpha1.MetricResult) []attribute.KeyValue {
+	counts := map[v1alpha1.AnalysisPhase]int64{}
+	for _, result := range results {
+		counts[result.Phase]++
+	}
+	return []attribute.KeyValue{
+		attribute.Int("argo.rollouts.analysis_run.metric_results.count", len(results)),
+		attribute.Int64("argo.rollouts.analysis_run.metric_results.pending.count", counts[v1alpha1.AnalysisPhasePending]),
+		attribute.Int64("argo.rollouts.analysis_run.metric_results.running.count", counts[v1alpha1.AnalysisPhaseRunning]),
+		attribute.Int64("argo.rollouts.analysis_run.metric_results.successful.count", counts[v1alpha1.AnalysisPhaseSuccessful]),
+		attribute.Int64("argo.rollouts.analysis_run.metric_results.failed.count", counts[v1alpha1.AnalysisPhaseFailed]),
+		attribute.Int64("argo.rollouts.analysis_run.metric_results.error.count", counts[v1alpha1.AnalysisPhaseError]),
+		attribute.Int64("argo.rollouts.analysis_run.metric_results.inconclusive.count", counts[v1alpha1.AnalysisPhaseInconclusive]),
+	}
 }
 
 func (c *Controller) jobParentReference(obj any) (*v1.OwnerReference, string) {
