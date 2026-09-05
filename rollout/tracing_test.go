@@ -28,6 +28,10 @@ func TestRolloutSyncHandlerCreatesIndependentRootSpan(t *testing.T) {
 	rollout.UID = types.UID("rollout-uid")
 	rollout.Labels = map[string]string{"private-label": "sensitive-value"}
 	rollout.Annotations["private-annotation"] = "sensitive-value"
+	rollout.Annotations["observability.demo/deployment-id"] = "checkout-42"
+	rollout.Annotations["observability.demo/traceparent"] = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	rollout.Annotations["observability.demo/source-revision"] = "source-sha"
+	rollout.Annotations["observability.demo/rollback-of"] = "checkout-41"
 	rollout.Spec.Strategy.Canary = &v1alpha1.CanaryStrategy{Steps: []v1alpha1.CanaryStep{
 		{SetWeight: ptr.To[int32](20)},
 		{Analysis: &v1alpha1.RolloutAnalysis{}},
@@ -53,6 +57,10 @@ func TestRolloutSyncHandlerCreatesIndependentRootSpan(t *testing.T) {
 	assert.False(t, span.Parent().IsValid(), "reconciliation must not inherit the worker context")
 	assert.Equal(t, codes.Error, span.Status().Code)
 	assert.Equal(t, "rollout aborted", span.Status().Description)
+	require.Len(t, span.Links(), 1)
+	assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", span.Links()[0].SpanContext.TraceID().String())
+	assert.Equal(t, "00f067aa0ba902b7", span.Links()[0].SpanContext.SpanID().String())
+	assert.True(t, span.Links()[0].SpanContext.IsRemote())
 	assert.Equal(t, map[string]attribute.Value{
 		"argo.rollouts.rollout.aborted":             attribute.BoolValue(true),
 		"argo.rollouts.rollout.current_step.index":  attribute.Int64Value(0),
@@ -65,7 +73,10 @@ func TestRolloutSyncHandlerCreatesIndependentRootSpan(t *testing.T) {
 		"argo.rollouts.rollout.promote_full":        attribute.BoolValue(false),
 		"argo.rollouts.rollout.strategy":            attribute.StringValue("canary"),
 		"argo.rollouts.rollout.uid":                 attribute.StringValue("rollout-uid"),
+		"deployment.id":                             attribute.StringValue("checkout-42"),
+		"deployment.rollback_of":                    attribute.StringValue("checkout-41"),
 		"k8s.namespace.name":                        attribute.StringValue(metav1.NamespaceDefault),
+		"vcs.ref.head.revision":                     attribute.StringValue("source-sha"),
 	}, rolloutSpanAttributes(span))
 }
 

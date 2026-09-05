@@ -403,6 +403,9 @@ func (c *Controller) syncHandler(ctx context.Context, key string) (retErr error)
 	var tracedRollout *v1alpha1.Rollout
 	defer func() {
 		recovered := recover()
+		if tracedRollout != nil {
+			traceutil.ApplyDemoCorrelation(span, tracedRollout.Annotations)
+		}
 		setRolloutTraceAttributes(span, tracedRollout)
 		if recovered != nil {
 			traceutil.EndSpanWithPanic(span)

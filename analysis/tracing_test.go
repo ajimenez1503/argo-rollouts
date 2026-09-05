@@ -26,12 +26,18 @@ func TestAnalysisRunSyncHandlerCreatesIndependentRootSpan(t *testing.T) {
 	count := intstr.FromInt(1)
 	run := &v1alpha1.AnalysisRun{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "checkout-analysis",
-			Namespace:   metav1.NamespaceDefault,
-			UID:         types.UID("analysis-run-uid"),
-			Generation:  7,
-			Labels:      map[string]string{"private-label": "sensitive-value"},
-			Annotations: map[string]string{"private-annotation": "sensitive-value"},
+			Name:       "checkout-analysis",
+			Namespace:  metav1.NamespaceDefault,
+			UID:        types.UID("analysis-run-uid"),
+			Generation: 7,
+			Labels:     map[string]string{"private-label": "sensitive-value"},
+			Annotations: map[string]string{
+				"private-annotation":                 "sensitive-value",
+				"observability.demo/deployment-id":   "checkout-42",
+				"observability.demo/traceparent":     "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+				"observability.demo/source-revision": "source-sha",
+				"observability.demo/rollback-of":     "checkout-41",
+			},
 		},
 		Spec: v1alpha1.AnalysisRunSpec{
 			Metrics: []v1alpha1.Metric{{
@@ -61,6 +67,10 @@ func TestAnalysisRunSyncHandlerCreatesIndependentRootSpan(t *testing.T) {
 	assert.False(t, span.Parent().IsValid(), "reconciliation must not inherit the worker context")
 	assert.Equal(t, codes.Error, span.Status().Code)
 	assert.Equal(t, "analysis run failed", span.Status().Description)
+	require.Len(t, span.Links(), 1)
+	assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", span.Links()[0].SpanContext.TraceID().String())
+	assert.Equal(t, "00f067aa0ba902b7", span.Links()[0].SpanContext.SpanID().String())
+	assert.True(t, span.Links()[0].SpanContext.IsRemote())
 	assert.Equal(t, map[string]attribute.Value{
 		"argo.rollouts.analysis_run.generation":                        attribute.Int64Value(7),
 		"argo.rollouts.analysis_run.metric_results.count":              attribute.Int64Value(1),
@@ -74,7 +84,10 @@ func TestAnalysisRunSyncHandlerCreatesIndependentRootSpan(t *testing.T) {
 		"argo.rollouts.analysis_run.name":                              attribute.StringValue("checkout-analysis"),
 		"argo.rollouts.analysis_run.phase":                             attribute.StringValue("Failed"),
 		"argo.rollouts.analysis_run.uid":                               attribute.StringValue("analysis-run-uid"),
+		"deployment.id":                                                attribute.StringValue("checkout-42"),
+		"deployment.rollback_of":                                       attribute.StringValue("checkout-41"),
 		"k8s.namespace.name":                                           attribute.StringValue(metav1.NamespaceDefault),
+		"vcs.ref.head.revision":                                        attribute.StringValue("source-sha"),
 	}, analysisRunSpanAttributes(span))
 }
 

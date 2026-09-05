@@ -181,6 +181,9 @@ func (c *Controller) syncHandler(ctx context.Context, key string) (retErr error)
 	var tracedRun *v1alpha1.AnalysisRun
 	defer func() {
 		recovered := recover()
+		if tracedRun != nil {
+			traceutil.ApplyDemoCorrelation(span, tracedRun.Annotations)
+		}
 		setAnalysisRunTraceAttributes(span, tracedRun)
 		if recovered != nil {
 			traceutil.EndSpanWithPanic(span)
